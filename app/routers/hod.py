@@ -749,40 +749,42 @@ def attendance_add_trainee(
         raise HTTPException(status_code=404, detail="الدورة غير موجودة")
     _assert_can_manage_course(user, course, db)
 
-    # الحصول على البيانات من ملف الإكسيل فقط
+    # البحث عن المتدرب من قاعدة البيانات أولاً (sf01)
     stu = None
     try:
-        import sys
-        import os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        from excel_data_reference import get_student_by_id
-        
-        student_data = get_student_by_id(trainee_no)
-        if student_data:
-            stu = {
-                "student_id": student_data.get('student_id', trainee_no),
-                "student_name": student_data.get('student_Name', '') or student_data.get('student_name', ''),
-                "major": student_data.get('Major', '') or student_data.get('major', '')
-            }
+        stu = db.execute(
+            text("""
+                SELECT student_id, "student_Name" AS student_name, "Major" AS major
+                FROM sf01 WHERE student_id = :sid LIMIT 1
+            """),
+            {"sid": int(trainee_no)},
+        ).mappings().first()
     except Exception as e:
+        print(f"[DEBUG] Error searching in sf01: {e}")
         pass
-    
-    # إذا لم نجد من الإكسيل، حاول من جدول sf01 مباشرة
+
+    # إذا لم نجد من قاعدة البيانات، حاول من ملف الإكسيل (اختياري - فقط إذا كان موجودًا)
     if not stu:
         try:
-            stu = db.execute(
-                text("""
-                    SELECT student_id, "student_Name" AS student_name, "Major" AS major
-                    FROM sf01 WHERE student_id = :sid LIMIT 1
-                """),
-                {"sid": int(trainee_no)},
-            ).mappings().first()
-        except Exception:
-            stu = None
+            import sys
+            import os
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            from excel_data_reference import get_student_by_id
+            
+            student_data = get_student_by_id(trainee_no)
+            if student_data:
+                stu = {
+                    "student_id": student_data.get('student_id', trainee_no),
+                    "student_name": student_data.get('student_Name', '') or student_data.get('student_name', ''),
+                    "major": student_data.get('Major', '') or student_data.get('major', '')
+                }
+        except Exception as e:
+            print(f"[DEBUG] Error searching in Excel: {e}")
+            pass
 
     # إذا لم نجد المتدرب في أي مكان، ارجع خطأ
     if not stu:
-        error_msg = f"لا يوجد متدرب برقم {trainee_no} في قاعدة البيانات"
+        error_msg = f"لا يوجد متدرب برقم {trainee_no} في قاعدة البيانات. تأكد من أن رقم المتدرب صحيح وموجود في جدول sf01."
         encoded_error = quote(error_msg, safe='')
         return RedirectResponse(url=f"/hod/attendance/{course.id}?trainee_no={trainee_no}&error={encoded_error}", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -790,17 +792,23 @@ def attendance_add_trainee(
     if course.capacity and current_count >= course.capacity:
         raise HTTPException(status_code=400, detail="تم الوصول للسعة القصوى لهذه الدورة")
 
-    db.execute(
-        text("""
-            INSERT INTO course_enrollments (course_id, trainee_no, trainee_name, trainee_major, status, present)
-            VALUES (:cid, :tno, :tname, :tmajor, 'registered', 0)
-            ON CONFLICT (course_id, trainee_no) DO UPDATE
-              SET trainee_name  = EXCLUDED.trainee_name,
-                  trainee_major = EXCLUDED.trainee_major
-        """),
-        {"cid": course.id, "tno": str(stu["student_id"]), "tname": stu["student_name"], "tmajor": stu["major"]},
-    )
-    db.commit()
+    try:
+        db.execute(
+            text("""
+                INSERT INTO course_enrollments (course_id, trainee_no, trainee_name, trainee_major, status, present)
+                VALUES (:cid, :tno, :tname, :tmajor, 'registered', 0)
+                ON CONFLICT (course_id, trainee_no) DO UPDATE
+                  SET trainee_name  = EXCLUDED.trainee_name,
+                      trainee_major = EXCLUDED.trainee_major
+            """),
+            {"cid": course.id, "tno": str(stu["student_id"]), "tname": stu["student_name"], "tmajor": stu["major"]},
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] Failed to insert enrollment: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"فشل إضافة المتدرب: {str(e)}")
+    
     return RedirectResponse(url=f"/hod/attendance/{course.id}?trainee_no={trainee_no}&ok=1", status_code=status.HTTP_303_SEE_OTHER)
 
 @router.post("/attendance/{course_id}/mark")
@@ -907,54 +915,64 @@ def enroll_manual_submit(
         raise HTTPException(status_code=404, detail="الدورة غير موجودة")
     _assert_can_manage_course(user, course, db)
 
+    # البحث عن المتدرب من قاعدة البيانات أولاً (sf01)
     stu = None
     try:
-        import sys
-        import os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        from excel_data_reference import get_student_by_id
-        
-        student_data = get_student_by_id(trainee_no)
-        if student_data:
-            stu = {
-                "student_id": student_data.get('student_id', trainee_no),
-                "student_name": student_data.get('student_Name', '') or student_data.get('student_name', ''),
-                "major": student_data.get('Major', '') or student_data.get('major', '')
-            }
-    except Exception:
+        stu = db.execute(
+            text("""
+                SELECT student_id, "student_Name" AS student_name, "Major" AS major
+                FROM sf01 WHERE student_id = :sid LIMIT 1
+            """),
+            {"sid": int(trainee_no)},
+        ).mappings().first()
+    except Exception as e:
+        print(f"[DEBUG] Error searching in sf01: {e}")
         pass
     
+    # إذا لم نجد من قاعدة البيانات، حاول من ملف الإكسيل (اختياري - فقط إذا كان موجودًا)
     if not stu:
         try:
-            stu = db.execute(
-                text("""
-                    SELECT student_id, "student_Name" AS student_name, "Major" AS major
-                    FROM sf01 WHERE student_id = :sid LIMIT 1
-                """),
-                {"sid": int(trainee_no)},
-            ).mappings().first()
-        except Exception:
-            stu = None
+            import sys
+            import os
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            from excel_data_reference import get_student_by_id
+            
+            student_data = get_student_by_id(trainee_no)
+            if student_data:
+                stu = {
+                    "student_id": student_data.get('student_id', trainee_no),
+                    "student_name": student_data.get('student_Name', '') or student_data.get('student_name', ''),
+                    "major": student_data.get('Major', '') or student_data.get('major', '')
+                }
+        except Exception as e:
+            print(f"[DEBUG] Error searching in Excel: {e}")
+            pass
     
     if not stu:
         # إرجاع خطأ إذا لم يكن المتدرب موجود
-        raise HTTPException(status_code=400, detail=f"لا يوجد متدرب برقم {trainee_no} في قاعدة البيانات")
+        raise HTTPException(status_code=400, detail=f"لا يوجد متدرب برقم {trainee_no} في قاعدة البيانات. تأكد من أن رقم المتدرب صحيح وموجود في جدول sf01.")
 
     current_count = db.execute(text("SELECT COUNT(*) FROM course_enrollments WHERE course_id = :cid"), {"cid": course.id}).scalar() or 0
     if course.capacity and current_count >= course.capacity:
         raise HTTPException(status_code=400, detail="تم الوصول للسعة القصوى لهذه الدورة")
 
-    db.execute(
-        text("""
-            INSERT INTO course_enrollments (course_id, trainee_no, trainee_name, trainee_major, status, present)
-            VALUES (:cid, :tno, :tname, :tmajor, 'registered', 0)
-            ON CONFLICT (course_id, trainee_no) DO UPDATE
-              SET trainee_name  = EXCLUDED.trainee_name,
-                  trainee_major = EXCLUDED.trainee_major
-        """),
-        {"cid": course.id, "tno": str(stu["student_id"]), "tname": stu["student_name"], "tmajor": stu["major"]},
-    )
-    db.commit()
+    try:
+        db.execute(
+            text("""
+                INSERT INTO course_enrollments (course_id, trainee_no, trainee_name, trainee_major, status, present)
+                VALUES (:cid, :tno, :tname, :tmajor, 'registered', 0)
+                ON CONFLICT (course_id, trainee_no) DO UPDATE
+                  SET trainee_name  = EXCLUDED.trainee_name,
+                      trainee_major = EXCLUDED.trainee_major
+            """),
+            {"cid": course.id, "tno": str(stu["student_id"]), "tname": stu["student_name"], "tmajor": stu["major"]},
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] Failed to insert enrollment: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"فشل إضافة المتدرب: {str(e)}")
+    
     return RedirectResponse(url=f"/hod/courses/{course.id}/enroll-manual?trainee_no={trainee_no}&ok=1", status_code=status.HTTP_303_SEE_OTHER)
 
 @router.get("/certificates/issue")
